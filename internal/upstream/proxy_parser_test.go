@@ -753,3 +753,270 @@ func TestGrpcPassPortDefaults(t *testing.T) {
 		})
 	}
 }
+
+func TestParseProxyTargetsFromMultipleConfigs(t *testing.T) {
+	// Simulate your exact use case:
+	// A.conf contains upstream definition
+	// B.conf contains proxy_pass/grpc_pass that references the upstream
+	configContents := map[string]string{
+		"/etc/nginx/conf.d/A.conf": `
+upstream sunstore {
+    keepalive 100;
+    server 120.78.154.134:443;
+}
+
+upstream asr {
+    server localhost:50051;
+    server localhost:50052;
+}
+`,
+		"/etc/nginx/conf.d/B.conf": `
+server {
+    listen 80;
+    server_name example.com;
+    location /api {
+        proxy_pass https://sunstore;
+    }
+    location /grpc {
+        grpc_pass grpcs://asr;
+    }
+}
+`,
+		"/etc/nginx/conf.d/C.conf": `
+server {
+    listen 443 ssl;
+    server_name grpc.example.com;
+    location /direct {
+        proxy_pass http://192.168.1.100:8080;
+    }
+    location /grpc-direct {
+        grpc_pass grpc://api.example.com:9090;
+    }
+}
+`,
+	}
+
+	targets := ParseProxyTargetsFromMultipleConfigs(configContents)
+
+	t.Logf("Found %d targets from multiple configs:", len(targets))
+	for i, target := range targets {
+		t.Logf("Target %d: Host=%s, Port=%s, Type=%s",
+			i+1, target.Host, target.Port, target.Type)
+	}
+
+	// Expected targets:
+	// 1. From upstream sunstore: 120.78.154.134:443 (upstream)
+	// 2. From upstream asr: localhost:50051 (upstream)
+	// 3. From upstream asr: localhost:50052 (upstream)
+	// 4. From direct proxy_pass: 192.168.1.100:8080 (proxy_pass)
+	// 5. From direct grpc_pass: api.example.com:9090 (grpc_pass)
+	// NOT included: https://sunstore and grpcs://asr (these are upstream references)
+
+	expectedTargets := map[string]string{
+		"120.78.154.134:443":   "upstream",
+		"localhost:50051":      "upstream",
+		"localhost:50052":      "upstream",
+		"192.168.1.100:8080":   "proxy_pass",
+		"api.example.com:9090": "grpc_pass",
+	}
+
+	if len(targets) != len(expectedTargets) {
+		t.Errorf("Expected %d targets, got %d", len(expectedTargets), len(targets))
+	}
+
+	found := make(map[string]string)
+	for _, target := range targets {
+		key := target.Host + ":" + target.Port
+		found[key] = target.Type
+	}
+
+	for expectedKey, expectedType := range expectedTargets {
+		if foundType, exists := found[expectedKey]; !exists {
+			t.Errorf("Expected to find target: %s with type %s", expectedKey, expectedType)
+		} else if foundType != expectedType {
+			t.Errorf("Target %s: expected type %s, got %s", expectedKey, expectedType, foundType)
+		}
+	}
+
+	// Verify that upstream references are NOT included as separate targets
+	upstreamRefs := []string{"sunstore:443", "asr:443"}
+	for _, ref := range upstreamRefs {
+		if _, exists := found[ref]; exists {
+			t.Errorf("Upstream reference %s should NOT be included as a separate target", ref)
+		}
+	}
+}
+
+func TestCrossFileUpstreamReferenceBugFix(t *testing.T) {
+	// This test specifically addresses the bug you reported:
+	// upstream sunstore in A.conf, proxy_pass https://sunstore in B.conf
+	// should resolve to 120.78.154.134:443, not sunstore:443
+
+	configContents := map[string]string{
+		"A.conf": `upstream sunstore {
+    keepalive 100;
+    server 120.78.154.134:443;
+}`,
+		"B.conf": `server {
+    listen 80;
+    location / {
+        proxy_pass https://sunstore;
+    }
+}`,
+	}
+
+	targets := ParseProxyTargetsFromMultipleConfigs(configContents)
+
+	t.Logf("Bug fix test - Found %d targets:", len(targets))
+	for i, target := range targets {
+		t.Logf("Target %d: Host=%s, Port=%s, Type=%s",
+			i+1, target.Host, target.Port, target.Type)
+	}
+
+	// Should only find the actual upstream server, not the reference
+	if len(targets) != 1 {
+		t.Errorf("Expected exactly 1 target (the upstream server), got %d", len(targets))
+	}
+
+	if len(targets) > 0 {
+		target := targets[0]
+		if target.Host != "120.78.154.134" || target.Port != "443" || target.Type != "upstream" {
+			t.Errorf("Expected target 120.78.154.134:443 (upstream), got %s:%s (%s)",
+				target.Host, target.Port, target.Type)
+		}
+	}
+}
+
+func TestCrossFileUpstreamReferenceFixed(t *testing.T) {
+	// This test verifies that the fix for cross-file upstream references works correctly
+	// Simulate the service scanning multiple config files sequentially
+
+	service := GetUpstreamService()
+
+	// Clear any existing state
+	service.targetsMutex.Lock()
+	service.globalUpstreams = make(map[string]bool)
+	service.targets = make(map[string]*TargetInfo)
+	service.targetsMutex.Unlock()
+
+	// First config file (A.conf) - contains upstream definition
+	configA := `upstream sunstore {
+    keepalive 100;
+    server 120.78.154.134:443;
+}
+
+upstream asr {
+    server localhost:50051;
+    server localhost:50052;
+}`
+
+	// Simulate scanning config A (this updates global upstreams)
+	service.updateUpstreamDefinitions("/etc/nginx/conf.d/A.conf", configA)
+
+	// Verify global upstreams were updated
+	globalUpstreams := service.GetGlobalUpstreams()
+	if !globalUpstreams["sunstore"] {
+		t.Error("Expected sunstore upstream to be registered globally")
+	}
+	if !globalUpstreams["asr"] {
+		t.Error("Expected asr upstream to be registered globally")
+	}
+
+	// Second config file (B.conf) - contains proxy_pass/grpc_pass that reference upstreams
+	configB := `server {
+    listen 80;
+    server_name example.com;
+    location /api {
+        proxy_pass https://sunstore;
+    }
+    location /grpc {
+        grpc_pass grpcs://asr;
+    }
+    location /direct {
+        proxy_pass http://192.168.1.100:8080;
+    }
+}`
+
+	// Parse config B - should NOT create targets for upstream references
+	targets := ParseProxyTargetsFromRawContent(configB)
+
+	t.Logf("Found %d targets in config B:", len(targets))
+	for i, target := range targets {
+		t.Logf("  Target %d: %s:%s (%s)", i+1, target.Host, target.Port, target.Type)
+	}
+
+	// We should only find the direct proxy target, not the upstream references
+	expectedTargets := []struct {
+		host string
+		port string
+		typ  string
+	}{
+		{"192.168.1.100", "8080", "proxy_pass"},
+	}
+
+	if len(targets) != len(expectedTargets) {
+		t.Errorf("Expected %d targets, got %d", len(expectedTargets), len(targets))
+	}
+
+	for i, expected := range expectedTargets {
+		if i >= len(targets) {
+			t.Errorf("Missing target %d: %s:%s (%s)", i+1, expected.host, expected.port, expected.typ)
+			continue
+		}
+
+		target := targets[i]
+		if target.Host != expected.host || target.Port != expected.port || target.Type != expected.typ {
+			t.Errorf("Target %d mismatch: expected %s:%s (%s), got %s:%s (%s)",
+				i+1, expected.host, expected.port, expected.typ,
+				target.Host, target.Port, target.Type)
+		}
+	}
+
+	// Verify that https://sunstore and grpcs://asr were correctly identified as upstream references
+	// (they should NOT appear in the targets list)
+	for _, target := range targets {
+		if target.Host == "sunstore" {
+			t.Error("sunstore should not appear as a target (it's an upstream reference)")
+		}
+		if target.Host == "asr" {
+			t.Error("asr should not appear as a target (it's an upstream reference)")
+		}
+	}
+
+	// Now parse config A to get the actual upstream servers
+	targetsA := ParseProxyTargetsFromRawContent(configA)
+
+	t.Logf("Found %d targets in config A:", len(targetsA))
+	for i, target := range targetsA {
+		t.Logf("  Target %d: %s:%s (%s)", i+1, target.Host, target.Port, target.Type)
+	}
+
+	// Config A should contain the actual upstream servers
+	expectedUpstreamTargets := []struct {
+		host string
+		port string
+		typ  string
+	}{
+		{"120.78.154.134", "443", "upstream"},
+		{"localhost", "50051", "upstream"},
+		{"localhost", "50052", "upstream"},
+	}
+
+	if len(targetsA) != len(expectedUpstreamTargets) {
+		t.Errorf("Expected %d upstream targets, got %d", len(expectedUpstreamTargets), len(targetsA))
+	}
+
+	for i, expected := range expectedUpstreamTargets {
+		if i >= len(targetsA) {
+			t.Errorf("Missing upstream target %d: %s:%s (%s)", i+1, expected.host, expected.port, expected.typ)
+			continue
+		}
+
+		target := targetsA[i]
+		if target.Host != expected.host || target.Port != expected.port || target.Type != expected.typ {
+			t.Errorf("Upstream target %d mismatch: expected %s:%s (%s), got %s:%s (%s)",
+				i+1, expected.host, expected.port, expected.typ,
+				target.Host, target.Port, target.Type)
+		}
+	}
+}

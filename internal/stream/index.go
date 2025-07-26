@@ -41,6 +41,13 @@ func scanForStream(configPath string, content []byte) error {
 		ProxyTargets: []upstream.ProxyTarget{},
 	}
 
+	// Ensure upstream service has the latest global upstream definitions
+	upstreamService := upstream.GetUpstreamService()
+	if upstreamService != nil {
+		// Force a rescan of all upstream definitions to ensure we have the latest global state
+		upstreamService.RefreshGlobalUpstreams()
+	}
+
 	// Parse proxy targets from the configuration content
 	streamIndex.ProxyTargets = upstream.ParseProxyTargetsFromRawContent(string(content))
 	// Only store if we found proxy targets

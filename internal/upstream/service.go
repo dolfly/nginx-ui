@@ -1,10 +1,17 @@
 package upstream
 
 import (
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/0xJacky/Nginx-UI/internal/cache"
+	"github.com/0xJacky/Nginx-UI/internal/nginx"
+	"github.com/uozi-tech/cosy/logger"
 )
 
 // TargetInfo contains proxy target information with source config
@@ -19,6 +26,7 @@ type UpstreamService struct {
 	targets         map[string]*TargetInfo // key: host:port
 	availabilityMap map[string]*Status     // key: host:port
 	configTargets   map[string][]string    // configPath -> []targetKeys
+	globalUpstreams map[string]bool        // global upstream names across all configs
 	targetsMutex    sync.RWMutex
 	lastUpdateTime  time.Time
 	testInProgress  bool
@@ -37,6 +45,7 @@ func GetUpstreamService() *UpstreamService {
 			targets:         make(map[string]*TargetInfo),
 			availabilityMap: make(map[string]*Status),
 			configTargets:   make(map[string][]string),
+			globalUpstreams: make(map[string]bool),
 			lastUpdateTime:  time.Now(),
 		}
 	})
@@ -50,13 +59,36 @@ func init() {
 
 // scanForProxyTargets is the callback function for cache scanner
 func scanForProxyTargets(configPath string, content []byte) error {
-	// Parse proxy targets from config content
-	targets := ParseProxyTargetsFromRawContent(string(content))
-
 	service := GetUpstreamService()
+
+	// First pass: scan and update global upstream definitions
+	service.updateUpstreamDefinitions(configPath, string(content))
+
+	// Second pass: parse proxy targets with updated global upstream context
+	targets := ParseProxyTargetsFromRawContent(string(content))
 	service.updateTargetsFromConfig(configPath, targets)
 
 	return nil
+}
+
+// updateUpstreamDefinitions scans content for upstream definitions and updates global upstream map
+func (s *UpstreamService) updateUpstreamDefinitions(configPath string, content string) {
+	s.targetsMutex.Lock()
+	defer s.targetsMutex.Unlock()
+
+	logger.Debug("updateUpstreamDefinitions: Scanning upstream definitions in", configPath)
+
+	// Use regex to find upstream blocks
+	upstreamRegex := regexp.MustCompile(`(?s)upstream\s+([^\s]+)\s*\{`)
+	matches := upstreamRegex.FindAllStringSubmatch(content, -1)
+
+	for _, match := range matches {
+		if len(match) >= 2 {
+			upstreamName := match[1]
+			s.globalUpstreams[upstreamName] = true
+			logger.Debug("updateUpstreamDefinitions: Added global upstream", upstreamName, "from", configPath)
+		}
+	}
 }
 
 // updateTargetsFromConfig updates proxy targets from a specific config file
@@ -88,9 +120,9 @@ func (s *UpstreamService) updateTargetsFromConfig(configPath string, targets []P
 				if isOnlyConfig {
 					delete(s.targets, key)
 					delete(s.availabilityMap, key)
-					// logger.Debug("Removed proxy target:", key, "from config:", configPath)
+					logger.Debug("Removed proxy target:", key, "from config:", configPath)
 				} else {
-					// logger.Debug("Keeping proxy target:", key, "still used by other configs")
+					logger.Debug("Keeping proxy target:", key, "still used by other configs")
 				}
 			}
 		}
@@ -106,7 +138,7 @@ func (s *UpstreamService) updateTargetsFromConfig(configPath string, targets []P
 			// Update existing target with latest info
 			existingTarget.LastSeen = now
 			existingTarget.ConfigPath = configPath // Update to latest config that referenced it
-			// logger.Debug("Updated proxy target:", key, "from config:", configPath)
+			logger.Debug("Updated proxy target:", key, "from config:", configPath)
 		} else {
 			// Add new target
 			s.targets[key] = &TargetInfo{
@@ -114,15 +146,13 @@ func (s *UpstreamService) updateTargetsFromConfig(configPath string, targets []P
 				ConfigPath:  configPath,
 				LastSeen:    now,
 			}
-			// logger.Debug("Added proxy target:", key, "type:", target.Type, "from config:", configPath)
+			logger.Debug("Added proxy target:", key, "type:", target.Type, "from config:", configPath)
 		}
 	}
 
 	// Update config target mapping
 	s.configTargets[configPath] = newTargetKeys
-	s.lastUpdateTime = now
-
-	// logger.Debug("Config", configPath, "updated with", len(targets), "targets")
+	logger.Debug("Config", configPath, "updated with", len(targets), "targets")
 }
 
 // GetTargets returns a copy of current proxy targets
@@ -171,13 +201,91 @@ func (s *UpstreamService) GetAvailabilityMap() map[string]*Status {
 	return result
 }
 
+// GetGlobalUpstreams returns a copy of the global upstream names map
+func (s *UpstreamService) GetGlobalUpstreams() map[string]bool {
+	s.targetsMutex.RLock()
+	defer s.targetsMutex.RUnlock()
+
+	// Create a copy to avoid race conditions
+	result := make(map[string]bool)
+	for name, exists := range s.globalUpstreams {
+		result[name] = exists
+	}
+	return result
+}
+
+// RefreshGlobalUpstreams rescans all nginx config files to update global upstream definitions
+func (s *UpstreamService) RefreshGlobalUpstreams() error {
+	s.targetsMutex.Lock()
+	defer s.targetsMutex.Unlock()
+
+	// Clear existing global upstreams
+	s.globalUpstreams = make(map[string]bool)
+	logger.Debug("RefreshGlobalUpstreams: Cleared existing global upstreams")
+
+	// Get nginx config path and scan all config files
+	configPath := nginx.GetConfPath()
+	logger.Debug("RefreshGlobalUpstreams: Scanning config path:", configPath)
+
+	// Walk through all config files
+	err := filepath.WalkDir(configPath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip directories and non-regular files
+		if d.IsDir() || !d.Type().IsRegular() {
+			return nil
+		}
+
+		// Skip files that don't look like nginx config files
+		if !strings.HasSuffix(path, ".conf") && !strings.Contains(path, "nginx.conf") {
+			return nil
+		}
+
+		// Read and scan the file
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			logger.Debug("RefreshGlobalUpstreams: Failed to read file:", path, readErr)
+			return nil // Continue with other files
+		}
+
+		// Scan for upstream definitions in this file
+		s.updateUpstreamDefinitionsFromContent(path, string(content))
+		return nil
+	})
+
+	if err != nil {
+		logger.Error("RefreshGlobalUpstreams: Error walking config directory:", err)
+		return err
+	}
+
+	logger.Debug("RefreshGlobalUpstreams: Completed scan, found", len(s.globalUpstreams), "global upstreams")
+	return nil
+}
+
+// updateUpstreamDefinitionsFromContent scans content for upstream definitions (without lock)
+func (s *UpstreamService) updateUpstreamDefinitionsFromContent(configPath string, content string) {
+	// Use regex to find upstream blocks
+	upstreamRegex := regexp.MustCompile(`(?s)upstream\s+([^\s]+)\s*\{`)
+	matches := upstreamRegex.FindAllStringSubmatch(content, -1)
+
+	for _, match := range matches {
+		if len(match) >= 2 {
+			upstreamName := match[1]
+			s.globalUpstreams[upstreamName] = true
+			logger.Debug("RefreshGlobalUpstreams: Found upstream", upstreamName, "in", configPath)
+		}
+	}
+}
+
 // PerformAvailabilityTest performs availability test for all targets
 func (s *UpstreamService) PerformAvailabilityTest() {
 	// Prevent concurrent tests
 	s.testMutex.Lock()
 	if s.testInProgress {
 		s.testMutex.Unlock()
-		// logger.Debug("Availability test already in progress, skipping")
+		logger.Debug("Availability test already in progress, skipping")
 		return
 	}
 	s.testInProgress = true
@@ -195,11 +303,11 @@ func (s *UpstreamService) PerformAvailabilityTest() {
 	s.targetsMutex.RUnlock()
 
 	if targetCount == 0 {
-		// logger.Debug("No targets to test")
+		logger.Debug("No targets to test")
 		return
 	}
 
-	// logger.Debug("Performing availability test for", targetCount, "unique targets")
+	logger.Debug("Performing availability test for", targetCount, "unique targets")
 
 	// Separate targets into traditional and consul groups from the start
 	s.targetsMutex.RLock()
@@ -222,7 +330,7 @@ func (s *UpstreamService) PerformAvailabilityTest() {
 
 	// Test traditional targets using the original AvailabilityTest
 	if len(regularTargetKeys) > 0 {
-		// logger.Debug("Testing", len(regularTargetKeys), "traditional targets")
+		logger.Debug("Testing", len(regularTargetKeys), "traditional targets")
 		regularResults := AvailabilityTest(regularTargetKeys)
 		for k, v := range regularResults {
 			results[k] = v
@@ -231,7 +339,7 @@ func (s *UpstreamService) PerformAvailabilityTest() {
 
 	// Test consul targets using consul-specific logic
 	if len(consulTargets) > 0 {
-		// logger.Debug("Testing", len(consulTargets), "consul targets")
+		logger.Debug("Testing", len(consulTargets), "consul targets")
 		consulResults := TestDynamicTargets(consulTargets)
 		for k, v := range consulResults {
 			results[k] = v
@@ -243,7 +351,7 @@ func (s *UpstreamService) PerformAvailabilityTest() {
 	s.availabilityMap = results
 	s.targetsMutex.Unlock()
 
-	// logger.Debug("Availability test completed for", len(results), "targets")
+	logger.Debug("Availability test completed for", len(results), "targets")
 }
 
 // ClearTargets clears all targets (useful for testing or reloading)
@@ -256,7 +364,7 @@ func (s *UpstreamService) ClearTargets() {
 	s.configTargets = make(map[string][]string)
 	s.lastUpdateTime = time.Now()
 
-	// logger.Debug("Cleared all proxy targets")
+	logger.Debug("Cleared all proxy targets")
 }
 
 // GetLastUpdateTime returns the last time targets were updated
@@ -299,11 +407,11 @@ func (s *UpstreamService) RemoveConfigTargets(configPath string) {
 			if !isUsedByOthers {
 				delete(s.targets, key)
 				delete(s.availabilityMap, key)
-				// logger.Debug("Removed proxy target:", key, "after config removal:", configPath)
+				logger.Debug("Removed proxy target:", key, "after config removal:", configPath)
 			}
 		}
 		delete(s.configTargets, configPath)
 		s.lastUpdateTime = time.Now()
-		// logger.Debug("Removed config targets for:", configPath)
+		logger.Debug("Removed config targets for:", configPath)
 	}
 }

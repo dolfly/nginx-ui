@@ -220,6 +220,13 @@ func scanForSite(configPath string, content []byte) error {
 		siteIndex.Urls = append(siteIndex.Urls, url)
 	}
 
+	// Ensure upstream service has the latest global upstream definitions
+	upstreamService := upstream.GetUpstreamService()
+	if upstreamService != nil {
+		// Force a rescan of all upstream definitions to ensure we have the latest global state
+		upstreamService.RefreshGlobalUpstreams()
+	}
+
 	// Parse proxy targets from the configuration content
 	siteIndex.ProxyTargets = upstream.ParseProxyTargetsFromRawContent(string(content))
 
